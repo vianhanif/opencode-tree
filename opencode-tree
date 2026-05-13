@@ -497,6 +497,50 @@ def cleanup():
     info("Cleanup complete.")
 
 
+# ── Remove specific session ──────────────────────────────────────────
+def remove_session(session_pattern: str):
+    S["passive_mode"] = True
+
+    if not tmux_has_session(session_pattern):
+        warn(f"Session '{session_pattern}' not running.")
+
+    meta_dir = None
+    meta = None
+
+    for metafile in OPENCODE_TREE_DIR.rglob(".opencode-tree.json"):
+        m = read_metadata(metafile)
+        if m and m.get("tmux_session", "") == session_pattern:
+            meta = m
+            meta_dir = metafile.parent
+            break
+
+    if meta:
+        S["is_git_mode"] = meta.get("mode", "git") == "git"
+        S["branch"] = meta.get("branch")
+        S["repo_path"] = Path(meta.get("repo_path", "")) if meta.get("repo_path") else None
+        S["is_temp_branch"] = meta.get("temp_branch", False)
+        S["base_branch"] = meta.get("base_branch", "")
+        S["worktree_dir"] = meta_dir
+        sentinel = meta_dir / ".opencode-tree.cleaning" if meta_dir else None
+        S["sentinel_file"] = sentinel
+        if sentinel and sentinel.exists():
+            sentinel.unlink()
+        S["force"] = True
+        S["cleanup_done"] = False
+
+    if tmux_has_session(session_pattern):
+        info(f"Killing tmux session: \033[36m{session_pattern}\033[0m")
+        run(["tmux", "kill-session", "-t", session_pattern], quiet=True, capture=True)
+
+    if meta:
+        cleanup()
+    elif meta_dir:
+        shutil.rmtree(meta_dir, ignore_errors=True)
+        info(f"Removed directory: {meta_dir}")
+
+    info("Done.")
+
+
 # ── Prune stale ──────────────────────────────────────────────────────
 def prune_stale():
     if not OPENCODE_TREE_DIR.exists():
@@ -740,7 +784,9 @@ Examples:
   opencode-tree --resume .                Reattach to session
   opencode-tree --list                    Show all sessions
   opencode-tree --list --watch            Live-updating session monitor
-  opencode-tree --prune                   Clean stale worktrees
+   opencode-tree --prune                   Clean stale worktrees
+   opencode-tree --remove ot-core-feat-x   Kill session + remove worktree
+   opencode-tree --remove ot-plain-myapp   Remove plain session + directory
 
 Non-git directories:
   If the given path is not a git repo, opencode-tree skips all git operations
@@ -763,6 +809,8 @@ Environment:
                         help="Show all sessions (active and stale)")
     parser.add_argument("-w", "--watch", action="store_true",
                         help="With --list, continuously refresh the view")
+    parser.add_argument("--remove", "-R", metavar="SESSION",
+                        help="Kill a tmux session and remove its worktree")
     parser.add_argument("--prune", action="store_true",
                         help="Remove stale worktrees and exit")
     parser.add_argument("-b", "--base", "--from", dest="base", default=None,
@@ -771,7 +819,7 @@ Environment:
 
     args = parser.parse_args(argv)
 
-    if args.prune:
+    if args.remove or args.prune:
         return args
 
     if args.watch and not args.list:
@@ -800,6 +848,10 @@ def main():
     args = parse_args(sys.argv[1:])
     S["force"] = args.force
     S["no_tmux"] = args.no_tmux
+
+    if args.remove:
+        remove_session(args.remove)
+        return
 
     if args.list or args.watch:
         run_list_mode(args.watch)
