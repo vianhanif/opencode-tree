@@ -551,6 +551,13 @@ def remove_session(session_pattern: str):
         S["force"] = True
         S["cleanup_done"] = False
 
+    opencode_pid = meta.get("opencode_pid") if meta else None
+    if opencode_pid:
+        try:
+            os.kill(opencode_pid, signal.SIGTERM)
+        except OSError:
+            pass
+
     if tmux_has_session(session_pattern):
         info(f"Killing tmux session: \033[36m{session_pattern}\033[0m")
         run(["tmux", "kill-session", "-t", session_pattern], quiet=True, capture=True)
@@ -943,7 +950,16 @@ def main():
         info("Starting opencode in worktree (no tmux)...")
         info(f"Worktree: \033[36m{S['worktree_dir']}\033[0m")
         os.chdir(str(S["worktree_dir"]))
-        run(["opencode"])
+        proc = subprocess.Popen(["opencode"])
+        meta_path = S.get("metadata_file")
+        if meta_path and meta_path.exists():
+            try:
+                m = json.loads(meta_path.read_text())
+                m["opencode_pid"] = proc.pid
+                meta_path.write_text(json.dumps(m, indent=2))
+            except (OSError, json.JSONDecodeError):
+                pass
+        proc.wait()
         cleanup()
         return
 
