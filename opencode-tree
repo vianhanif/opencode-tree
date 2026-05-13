@@ -72,19 +72,6 @@ def confirm(prompt: str, default: bool = False) -> bool:
     return answer == "y"
 
 
-def choose(prompt: str, options: dict) -> str:
-    opts = "/".join(options.keys())
-    try:
-        answer = input(f"{prompt} [{opts}] ").strip().lower()
-    except (EOFError, KeyboardInterrupt):
-        print()
-        return ""
-    for key, action in options.items():
-        if answer == key:
-            return action
-    return ""
-
-
 # ── Subprocess helper ────────────────────────────────────────────────
 def run(cmd, cwd=None, capture=False, check=False, quiet=False, input_data=None):
     kwargs = {"cwd": str(cwd) if cwd else None}
@@ -441,20 +428,7 @@ def cleanup():
             if s_count > 0:
                 parts.append(f"{s_count} stashes")
             warn(f"Worktree has dirty state: {', '.join(parts)}")
-
-            if not S["force"]:
-                if is_temp:
-                    if not confirm("Temp branch — changes will be lost. Remove?"):
-                        die("Cleanup aborted")
-                else:
-                    action = choose("Uncommitted changes.",
-                                    {"s": "stash", "d": "destroy", "c": "cancel"})
-                    if action in ("cancel", ""):
-                        die("Cleanup aborted")
-                    elif action == "stash":
-                        ts = int(time.time())
-                        git("stash", "push", "-m", f"opencode-tree auto-stash {ts}", cwd=wt_dir)
-                        info("Changes stashed")
+            warn("Proceeding with cleanup — uncommitted changes will be lost.")
 
         if is_temp and branch:
             if remote_branch_exists(branch, repo):
