@@ -284,9 +284,20 @@ def create_worktree(branch: str):
             info(f"Worktree already exists at {existing}")
             return
         if Path(existing) == repo.resolve():
-            die(f"Branch '{branch}' is checked out in the main repo at {existing}.\n"
-                f"  Switch to another branch first: git checkout {S['base_branch']}")
-        die(f"Branch '{branch}' already has a worktree at: {existing}. Use --resume.")
+            d_files, s_count = is_dirty(repo) if repo.exists() else (0, 0)
+            if d_files > 0 or s_count > 0:
+                warn(f"Main repo has {d_files} uncommitted file(s) and {s_count} stash(es)")
+                if not S.get("force"):
+                    die(f"Main repo is dirty on branch '{branch}'. "
+                        f"Stash/commit first, or use --force to auto-stash and switch.")
+                info(f"Stashing main repo changes...")
+                git("stash", "push", "-m", f"opencode-tree auto-stash {int(time.time())}",
+                    cwd=repo)
+            base = S.get("base_branch", detect_default_branch(repo))
+            info(f"Main repo on '{branch}' — switching to '{base}' first...")
+            git("checkout", base, cwd=repo, check=True)
+        else:
+            die(f"Branch '{branch}' already has a worktree at: {existing}. Use --resume.")
 
     if wt_dir.exists():
         meta_file = wt_dir / ".opencode-tree.json"
