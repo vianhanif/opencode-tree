@@ -42,6 +42,7 @@ S = {
     "cleanup_done": False,
     "force": False,
     "no_tmux": False,
+    "passive_mode": False,
 }
 
 
@@ -325,6 +326,8 @@ def read_metadata(filepath: Path) -> dict:
 
 # ── Tmux (shared) ────────────────────────────────────────────────────
 def tmux_has_session(name: str) -> bool:
+    if not shutil.which("tmux"):
+        return False
     return run(["tmux", "has-session", "-t", name], quiet=True).returncode == 0
 
 
@@ -522,6 +525,126 @@ def prune_stale():
         info("No stale worktrees found.")
 
 
+# ── List sessions ────────────────────────────────────────────────────
+def collect_sessions():
+    sessions = []
+    active_tmux = set()
+
+    if shutil.which("tmux"):
+        result = run(["tmux", "list-sessions", "-F", "#{session_name}"],
+                     capture=True, quiet=True)
+        if result.returncode == 0:
+            for name in result.stdout.strip().split("\n"):
+                name = name.strip()
+                if name.startswith(f"{SESSION_PREFIX}-"):
+                    active_tmux.add(name)
+
+    if OPENCODE_TREE_DIR.exists():
+        for metafile in sorted(OPENCODE_TREE_DIR.rglob(".opencode-tree.json")):
+            meta = read_metadata(metafile)
+            if not meta:
+                continue
+            sn = meta.get("tmux_session", "")
+            sessions.append({
+                "session": sn,
+                "project": meta.get("project", "?"),
+                "branch": meta.get("branch", "?"),
+                "mode": meta.get("mode", "?"),
+                "active": sn in active_tmux,
+                "temp_branch": meta.get("temp_branch", False),
+                "created_at": meta.get("created_at", ""),
+                "repo_path": meta.get("repo_path", ""),
+            })
+            active_tmux.discard(sn)
+
+    for name in sorted(active_tmux):
+        sessions.append({
+            "session": name,
+            "project": "?",
+            "branch": "?",
+            "mode": "?",
+            "active": True,
+            "temp_branch": False,
+            "created_at": "",
+            "repo_path": "",
+        })
+
+    return sessions
+
+
+def display_sessions(sessions):
+    active = [s for s in sessions if s["active"]]
+    stale = [s for s in sessions if not s["active"]]
+    cols, _ = shutil.get_terminal_size()
+
+    if active:
+        print(f"\033[1mActive sessions ({len(active)}):\033[0m")
+        print("")
+        for s in sorted(active, key=lambda x: x["session"]):
+            label = f"{s['project']}/{s['branch']}" if s["mode"] == "git" else f"{s['project']} (plain)"
+            mode_str = "worktree" if s["mode"] == "git" else "plain"
+            print(f"  \033[32m●\033[0m  {s['session']}")
+            print(f"     target:  {label}")
+            print(f"     mode:    {mode_str}")
+            if s["temp_branch"]:
+                print(f"     note:    temp branch")
+            print("")
+
+    if stale:
+        print(f"\033[90mStale ({len(stale)}):\033[0m")
+        print("")
+        for s in sorted(stale, key=lambda x: x["session"]):
+            label = f"{s['project']}/{s['branch']}" if s["mode"] == "git" else f"{s['project']}"
+            print(f"  \033[90m○\033[0m  {s['session']}")
+            print(f"     target:  {label}")
+            print("")
+
+    if not active and not stale:
+        print("No sessions found.")
+        print("Start one with: opencode-tree .")
+
+
+def display_sessions_compact(sessions):
+    active = [s for s in sessions if s["active"]]
+    stale = [s for s in sessions if not s["active"]]
+
+    ts = datetime.now().strftime("%H:%M:%S")
+    print(f"\033[1mopencode-tree sessions\033[0m  [{ts}]  —  Ctrl+C to exit")
+    print("")
+
+    for s in sorted(active, key=lambda x: x["session"]):
+        label = f"{s['project']}/{s['branch']}" if s["mode"] == "git" else f"{s['project']} (plain)"
+        mode_str = "W" if s["mode"] == "git" else "P"
+        temp_mark = "T" if s["temp_branch"] else " "
+        print(f"  \033[32m●\033[0m  {mode_str}{temp_mark}  {s['session']:<45} {label}")
+
+    for s in sorted(stale, key=lambda x: x["session"]):
+        label = f"{s['project']}/{s['branch']}" if s["mode"] == "git" else f"{s['project']}"
+        print(f"  \033[90m○\033[0m  ?  {s['session']:<45} {label}   \033[90mstale\033[0m")
+
+    if not active and not stale:
+        print("  No sessions.")
+
+
+def run_list_mode(watch: bool):
+    S["passive_mode"] = True
+
+    if not watch:
+        sessions = collect_sessions()
+        display_sessions(sessions)
+        return
+
+    try:
+        while True:
+            os.system("clear")
+            sessions = collect_sessions()
+            display_sessions_compact(sessions)
+            time.sleep(2)
+    except KeyboardInterrupt:
+        print()
+        pass
+
+
 # ── Resume ───────────────────────────────────────────────────────────
 def resume_git_session(project: str, branch_arg: str):
     if branch_arg:
@@ -578,6 +701,8 @@ def resume_plain_session(project: str):
 # ── Signal ───────────────────────────────────────────────────────────
 def handle_signal(signum, frame):
     print()
+    if S.get("passive_mode"):
+        sys.exit(0)
     warn("Interrupt received. Running cleanup...")
     cleanup()
     sys.exit(1)
@@ -596,6 +721,8 @@ Examples:
   opencode-tree .  feature/x              Use existing branch
   opencode-tree /some/dir                 Plain mode (non-git directory)
   opencode-tree --resume .                Reattach to session
+  opencode-tree --list                    Show all sessions
+  opencode-tree --list --watch            Live-updating session monitor
   opencode-tree --prune                   Clean stale worktrees
 
 Non-git directories:
@@ -615,6 +742,10 @@ Environment:
                         help="Run opencode in current terminal (no tmux)")
     parser.add_argument("-r", "--resume", action="store_true",
                         help="Reattach to an existing session")
+    parser.add_argument("--list", action="store_true",
+                        help="Show all sessions (active and stale)")
+    parser.add_argument("-w", "--watch", action="store_true",
+                        help="With --list, continuously refresh the view")
     parser.add_argument("--prune", action="store_true",
                         help="Remove stale worktrees and exit")
     parser.add_argument("-b", "--base", default=None,
@@ -624,6 +755,12 @@ Environment:
     args = parser.parse_args(argv)
 
     if args.prune:
+        return args
+
+    if args.watch and not args.list:
+        args.list = True
+
+    if args.list:
         return args
 
     if not args.project and not args.resume:
@@ -647,7 +784,12 @@ def main():
     S["force"] = args.force
     S["no_tmux"] = args.no_tmux
 
+    if args.list or args.watch:
+        run_list_mode(args.watch)
+        return
+
     if args.prune:
+        S["passive_mode"] = True
         prune_stale()
         return
 
