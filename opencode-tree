@@ -796,8 +796,9 @@ Examples:
   opencode-tree .  feature/x              Use existing branch
   opencode-tree .  feature/x --from develop   Create feature/x from develop
   opencode-tree /some/dir                 Plain mode (non-git directory)
-  opencode-tree --resume .                Reattach to session
-  opencode-tree --list                    Show all sessions
+   opencode-tree --resume .                Reattach to session
+   opencode-tree --session ot-core-x       Attach by session name
+   opencode-tree --list                    Show all sessions
   opencode-tree --list --watch            Live-updating session monitor
    opencode-tree --prune                   Clean stale worktrees
    opencode-tree --remove ot-core-feat-x   Kill session + remove worktree
@@ -819,7 +820,9 @@ Environment:
     parser.add_argument("--no-tmux", action="store_true",
                         help="Run opencode in current terminal (no tmux)")
     parser.add_argument("-r", "--resume", action="store_true",
-                        help="Reattach to an existing session")
+                        help="Reattach to an existing session (by project path)")
+    parser.add_argument("--session", "-s", metavar="NAME",
+                        help="Attach to a running tmux session directly (e.g. ot-core-feat-x)")
     parser.add_argument("--list", action="store_true",
                         help="Show all sessions (active and stale)")
     parser.add_argument("-w", "--watch", action="store_true",
@@ -834,7 +837,7 @@ Environment:
 
     args = parser.parse_args(argv)
 
-    if args.remove or args.prune:
+    if args.session or args.remove or args.prune:
         return args
 
     if args.watch and not args.list:
@@ -866,6 +869,14 @@ def main():
 
     if args.remove:
         remove_session(args.remove)
+        return
+
+    if args.session:
+        if not tmux_has_session(args.session):
+            die(f"Session '{args.session}' not found.")
+        S["session_name"] = args.session
+        info(f"Attaching to session: \033[36m{args.session}\033[0m")
+        attach_loop()
         return
 
     if args.list or args.watch:

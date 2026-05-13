@@ -58,7 +58,8 @@ opencode-tree ~/projects/my-app  feature/x
 # Plain directory (non-git) — just launches tmux + opencode
 opencode-tree /some/folder
 
-opencode-tree --resume .             # Reattach to session
+opencode-tree --resume .             # Reattach to a project session
+opencode-tree --session ot-core-x   # Attach directly by tmux session name
 opencode-tree --remove ot-repo-branch  # Kill session + remove worktree
 opencode-tree --prune                # Clean stale worktrees
 opencode-tree --no-tmux .            # Without tmux
@@ -85,7 +86,8 @@ opencode-tree --no-tmux .            # Without tmux
 |------|-------------|
 | `-f, --force` | Skip all prompts during cleanup (now default behavior for dirty worktrees) |
 | `--no-tmux` | Run opencode in current terminal (no tmux session) |
-| `-r, --resume` | Reattach to an existing session |
+| `-r, --resume` | Reattach to an existing session (by project path) |
+| `-s, --session` | Attach to a running tmux session directly by name |
 | `-R, --remove` | Kill a tmux session and auto-clean its worktree |
 | `--prune` | Scan and remove stale worktrees, then exit |
 | `-b, --base <branch>` | Base branch for temp branches (auto-detected by default) |
