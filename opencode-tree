@@ -88,9 +88,10 @@ def choose(prompt: str, options: dict) -> str:
 def run(cmd, cwd=None, capture=False, check=False, quiet=False, input_data=None):
     kwargs = {"cwd": str(cwd) if cwd else None}
     if capture:
-        kwargs["capture_output"] = True
+        kwargs["stdout"] = subprocess.PIPE
+        kwargs["stderr"] = subprocess.PIPE if not quiet else subprocess.DEVNULL
         kwargs["text"] = True
-    if quiet:
+    elif quiet:
         kwargs["stdout"] = subprocess.DEVNULL
         kwargs["stderr"] = subprocess.DEVNULL
     if input_data is not None:
