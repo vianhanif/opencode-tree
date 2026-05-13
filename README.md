@@ -71,7 +71,7 @@ opencode-tree --no-tmux .            # Without tmux
 1. **Branch** — if you specify one, it's used (created from the repo's default branch if needed). If omitted, a temp branch `openworktree/<ts>-<random>` is created.
 2. **Worktree** — `git worktree add` creates an isolated checkout.
 3. **tmux** — session with `code` + `shell` windows.
-4. **Cleanup** — detects dirty state, deletes temp branch, removes worktree.
+4. **Cleanup** — destroys dirty state, deletes temp branch, removes worktree.
 
 ### Plain mode (non-git)
 
@@ -83,7 +83,7 @@ opencode-tree --no-tmux .            # Without tmux
 
 | Flag | Description |
 |------|-------------|
-| `-f, --force` | Skip all prompts during cleanup |
+| `-f, --force` | Skip all prompts during cleanup (now default behavior for dirty worktrees) |
 | `--no-tmux` | Run opencode in current terminal (no tmux session) |
 | `-r, --resume` | Reattach to an existing session |
 | `-R, --remove` | Kill a tmux session and auto-clean its worktree |
