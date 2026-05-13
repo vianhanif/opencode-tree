@@ -242,9 +242,9 @@ def create_branch_strategy(branch_arg: str) -> str:
         base_ref = f"origin/{base}"
         if remote_branch_exists(base, repo):
             git("fetch", "origin", base, cwd=repo, quiet=True)
-            git("checkout", "-b", br, base_ref, cwd=repo, capture=True, check=True)
+            git("branch", br, base_ref, cwd=repo, check=True)
         elif branch_exists(base, repo):
-            git("checkout", "-b", br, base, cwd=repo, capture=True, check=True)
+            git("branch", br, base, cwd=repo, check=True)
         else:
             die(f"Base branch '{base}' not found locally or on origin")
         return br
@@ -261,7 +261,7 @@ def create_branch_strategy(branch_arg: str) -> str:
     base_ref = f"origin/{base}"
     if not remote_branch_exists(base, repo):
         die(f"Base branch 'origin/{base}' not found")
-    git("checkout", "-b", branch_arg, base_ref, cwd=repo, check=True)
+    git("branch", branch_arg, base_ref, cwd=repo, check=True)
     return branch_arg
 
 
