@@ -200,15 +200,17 @@ def detect_default_branch(repo: Path) -> str:
 
 
 def check_existing_worktree(branch: str, cwd: Path):
+    result = git("rev-parse", "--abbrev-ref", "HEAD", cwd=cwd, capture=True, quiet=True)
+    if result.returncode == 0 and result.stdout.strip() == branch:
+        return str(cwd.resolve())
+
     result = git("worktree", "list", "--porcelain", cwd=cwd, capture=True)
     current_wt = None
-    current_branch = None
     for line in result.stdout.strip().split("\n"):
         if line.startswith("worktree "):
             current_wt = line[9:]
         elif line.startswith("branch refs/heads/"):
-            current_branch = line[17:]
-            if current_branch == branch:
+            if line[17:] == branch:
                 return current_wt
     return None
 
@@ -281,6 +283,9 @@ def create_worktree(branch: str):
         if Path(existing) == wt_dir:
             info(f"Worktree already exists at {existing}")
             return
+        if Path(existing) == repo.resolve():
+            die(f"Branch '{branch}' is checked out in the main repo at {existing}.\n"
+                f"  Switch to another branch first: git checkout {S['base_branch']}")
         die(f"Branch '{branch}' already has a worktree at: {existing}. Use --resume.")
 
     if wt_dir.exists():
