@@ -1,0 +1,665 @@
+#!/usr/bin/env python3
+"""
+opencode-tree — Isolated git worktree + tmux sessions for opencode
+
+Creates a temporary git worktree, launches opencode inside a tmux session,
+and auto-cleans the worktree when the session ends.
+"""
+
+import argparse
+import json
+import os
+import random
+import shutil
+import signal
+import string
+import subprocess
+import sys
+import time
+from datetime import datetime, timezone
+from pathlib import Path
+
+VERSION = "0.1.0"
+
+XDG_DATA_HOME = Path(os.environ.get("XDG_DATA_HOME", Path.home() / ".local" / "share"))
+OPENCODE_TREE_DIR = XDG_DATA_HOME / "opencode-tree"
+
+SESSION_PREFIX = "ot"
+
+# ── Shared state (mutated by main, read by cleanup/signal) ──────────
+S = {
+    "repo_path": None,
+    "branch": None,
+    "worktree_dir": None,
+    "session_name": None,
+    "is_temp_branch": False,
+    "base_branch": None,
+    "metadata_file": None,
+    "sentinel_file": None,
+    "cleanup_done": False,
+    "force": False,
+    "no_tmux": False,
+}
+
+
+# ── I/O helpers ──────────────────────────────────────────────────────
+def die(msg: str, code: int = 1) -> None:
+    print(f"\033[31merror:\033[0m {msg}", file=sys.stderr)
+    sys.exit(code)
+
+
+def info(msg: str) -> None:
+    print(f"\033[32m*\033[0m {msg}")
+
+
+def warn(msg: str) -> None:
+    print(f"\033[33mwarning:\033[0m {msg}", file=sys.stderr)
+
+
+def confirm(prompt: str, default: bool = False) -> bool:
+    suffix = " [Y/n]" if default else " [y/N]"
+    try:
+        answer = input(f"{prompt}{suffix} ").strip().lower()
+    except (EOFError, KeyboardInterrupt):
+        print()
+        return default
+    if default:
+        return answer != "n"
+    return answer == "y"
+
+
+def choose(prompt: str, options: dict) -> str:
+    opts = "/".join(options.keys())
+    try:
+        answer = input(f"{prompt} [{opts}] ").strip().lower()
+    except (EOFError, KeyboardInterrupt):
+        print()
+        return ""
+    for key, action in options.items():
+        if answer == key:
+            return action
+    return ""
+
+
+# ── Subprocess helper ────────────────────────────────────────────────
+def run(cmd, cwd=None, capture=False, check=False, quiet=False, input_data=None):
+    kwargs = {
+        "cwd": str(cwd) if cwd else None,
+    }
+    if capture:
+        kwargs["capture_output"] = True
+        kwargs["text"] = True
+    if quiet:
+        kwargs["stdout"] = subprocess.DEVNULL
+        kwargs["stderr"] = subprocess.DEVNULL
+    if input_data is not None:
+        kwargs["input"] = input_data
+    try:
+        result = subprocess.run(cmd, **kwargs)
+    except FileNotFoundError:
+        die(f"Command not found: {cmd[0]}")
+    if check and result.returncode != 0:
+        detail = result.stderr.strip() if capture else ""
+        msg = f"Command failed: {' '.join(cmd)}"
+        if detail:
+            msg += f"\n  {detail}"
+        die(msg)
+    return result
+
+
+# ── Slug ─────────────────────────────────────────────────────────────
+def slugify(name: str) -> str:
+    name = name.replace("/", "-")
+    name = "".join(c if c.isalnum() or c in "-_" else "-" for c in name)
+    while "--" in name:
+        name = name.replace("--", "-")
+    name = name.strip("-")
+    return name[:80]
+
+
+# ── Tool validation ─────────────────────────────────────────────────
+def validate_tools():
+    git_ver = run(["git", "--version"], capture=True).stdout.strip()
+    info(f"Using {git_ver}")
+
+    if not S["no_tmux"]:
+        if not shutil.which("tmux"):
+            warn("tmux not found. Falling back to --no-tmux mode.")
+            S["no_tmux"] = True
+
+
+# ── Repo helpers ─────────────────────────────────────────────────────
+def is_git_repo(path: Path) -> bool:
+    return path.exists() and (
+        (path / ".git").exists() or
+        run(["git", "rev-parse", "--git-dir"], cwd=path, quiet=True).returncode == 0
+    )
+
+
+def resolve_repo(project: str) -> Path:
+    p = Path(project)
+    if is_git_repo(p):
+        return p.resolve()
+
+    p = Path.cwd() / project
+    if is_git_repo(p):
+        return p.resolve()
+
+    extra_dirs = os.environ.get("OPENCODE_TREE_DIRS", "")
+    for base_str in extra_dirs.split(":"):
+        if not base_str.strip():
+            continue
+        p = Path(base_str.strip()) / project
+        if is_git_repo(p):
+            return p.resolve()
+
+    return None
+
+
+def detect_default_branch(repo: Path) -> str:
+    result = git("symbolic-ref", "refs/remotes/origin/HEAD", cwd=repo,
+                 capture=True, quiet=True)
+    if result.returncode == 0:
+        ref = result.stdout.strip()
+        return ref.replace("refs/remotes/origin/", "")
+    for candidate in ["main", "master"]:
+        if branch_exists(candidate, repo) or remote_branch_exists(candidate, repo):
+            return candidate
+    return "main"
+
+
+# ── Git helpers ──────────────────────────────────────────────────────
+def git(*args, cwd=None, capture=False, quiet=False, check=False) -> subprocess.CompletedProcess:
+    return run(["git"] + list(args), cwd=cwd, capture=capture, quiet=quiet, check=check)
+
+
+def branch_exists(branch: str, cwd: Path) -> bool:
+    return git("rev-parse", "--verify", branch, cwd=cwd, quiet=True, capture=True).returncode == 0
+
+
+def remote_branch_exists(branch: str, cwd: Path) -> bool:
+    return git("rev-parse", "--verify", f"origin/{branch}", cwd=cwd, quiet=True, capture=True).returncode == 0
+
+
+def check_existing_worktree(branch: str, cwd: Path):
+    result = git("worktree", "list", "--porcelain", cwd=cwd, capture=True)
+    lines = result.stdout.strip().split("\n")
+    current_wt = None
+    current_branch = None
+    for line in lines:
+        if line.startswith("worktree "):
+            current_wt = line[9:]
+        elif line.startswith("branch refs/heads/"):
+            current_branch = line[17:]
+            if current_branch == branch:
+                return current_wt
+    return None
+
+
+def is_dirty(cwd: Path) -> tuple:
+    status = git("status", "--porcelain", cwd=cwd, capture=True).stdout.strip()
+    stash_list = git("stash", "list", cwd=cwd, capture=True).stdout.strip()
+    dirty_files = len([l for l in status.split("\n") if l]) if status else 0
+    stash_count = len([l for l in stash_list.split("\n") if l]) if stash_list else 0
+    return dirty_files, stash_count
+
+
+def unpushed_commits(branch: str, base: str, cwd: Path) -> list:
+    result = git("log", f"origin/{base}..{branch}", "--oneline", cwd=cwd,
+                 capture=True, quiet=True)
+    lines = result.stdout.strip()
+    return [l for l in lines.split("\n") if l] if lines else []
+
+
+# ── Branch strategy ─────────────────────────────────────────────────
+def create_branch_strategy(branch_arg: str) -> str:
+    repo = S["repo_path"]
+    base = S["base_branch"]
+
+    if not branch_arg:
+        ts = int(time.time())
+        rand = "".join(random.choices(string.digits, k=6))
+        br = f"openworktree/{ts}-{rand}"
+        S["is_temp_branch"] = True
+        info(f"No branch specified — creating temp branch: \033[36m{br}\033[0m")
+
+        base_ref = f"origin/{base}"
+        if remote_branch_exists(base, repo):
+            git("fetch", "origin", base, cwd=repo, quiet=True)
+            git("checkout", "-b", br, base_ref, cwd=repo, capture=True, check=True)
+        elif branch_exists(base, repo):
+            git("checkout", "-b", br, base, cwd=repo, capture=True, check=True)
+        else:
+            die(f"Base branch '{base}' not found locally or on origin")
+        return br
+
+    if branch_exists(branch_arg, repo):
+        return branch_arg
+
+    if remote_branch_exists(branch_arg, repo):
+        info(f"Creating local branch '{branch_arg}' tracking origin/{branch_arg}")
+        git("branch", "--track", branch_arg, f"origin/{branch_arg}", cwd=repo, check=True)
+        return branch_arg
+
+    info(f"Branch '{branch_arg}' not found — creating from origin/{base}")
+    git("fetch", "origin", base, cwd=repo, quiet=True)
+    base_ref = f"origin/{base}"
+    if not remote_branch_exists(base, repo):
+        die(f"Base branch 'origin/{base}' not found")
+    git("checkout", "-b", branch_arg, base_ref, cwd=repo, check=True)
+    return branch_arg
+
+
+# ── Worktree ─────────────────────────────────────────────────────────
+def create_worktree(branch: str):
+    repo = S["repo_path"]
+    repo_name = repo.name
+    slug = slugify(branch)
+    wt_dir = OPENCODE_TREE_DIR / repo_name / slug
+
+    S["worktree_dir"] = wt_dir
+    S["metadata_file"] = wt_dir / ".opencode-tree.json"
+    S["sentinel_file"] = wt_dir / ".opencode-tree.cleaning"
+
+    existing = check_existing_worktree(branch, repo)
+    if existing:
+        if Path(existing) == wt_dir:
+            info(f"Worktree already exists at {existing}")
+            return
+        die(f"Branch '{branch}' already has a worktree at: {existing}. Use --resume to reattach.")
+
+    if wt_dir.exists():
+        meta_file = wt_dir / ".opencode-tree.json"
+        if meta_file.exists():
+            warn("Worktree directory exists but is not registered with git. Removing...")
+            shutil.rmtree(wt_dir)
+        else:
+            die(f"Directory {wt_dir} already exists and is not an opencode-tree worktree")
+
+    wt_dir.parent.mkdir(parents=True, exist_ok=True)
+
+    info(f"Creating worktree at: \033[36m{wt_dir}\033[0m")
+    git("worktree", "add", str(wt_dir), branch, cwd=repo, check=True)
+
+    valid = git("rev-parse", "--git-dir", cwd=wt_dir, quiet=True, capture=True).returncode == 0
+    if not valid:
+        shutil.rmtree(wt_dir, ignore_errors=True)
+        die("Worktree creation failed — directory cleaned up")
+
+
+def write_metadata(branch: str):
+    meta = {
+        "version": 1,
+        "project": S["repo_path"].name,
+        "branch": branch,
+        "repo_path": str(S["repo_path"]),
+        "temp_branch": S["is_temp_branch"],
+        "base_branch": S["base_branch"],
+        "created_at": datetime.now(timezone.utc).isoformat(),
+        "tmux_session": S["session_name"],
+        "script_pid": os.getpid(),
+    }
+    S["metadata_file"].write_text(json.dumps(meta, indent=2))
+
+
+def read_metadata(filepath: Path) -> dict:
+    try:
+        return json.loads(filepath.read_text())
+    except (FileNotFoundError, json.JSONDecodeError):
+        return None
+
+
+# ── Tmux ─────────────────────────────────────────────────────────────
+def tmux_has_session(name: str) -> bool:
+    return run(["tmux", "has-session", "-t", name], quiet=True).returncode == 0
+
+
+def setup_tmux_session():
+    repo_name = S["repo_path"].name
+    slug = slugify(S["branch"])
+    session = f"{SESSION_PREFIX}-{repo_name}-{slug}"
+    S["session_name"] = session
+
+    if tmux_has_session(session):
+        info(f"Session '{session}' already exists — will reattach")
+        return
+
+    wt_dir = S["worktree_dir"]
+    info(f"Creating tmux session: \033[36m{session}\033[0m")
+
+    run(["tmux", "new-session", "-d", "-s", session, "-c", str(wt_dir)])
+    run(["tmux", "set", "-g", "base-index", "1"], quiet=True)
+    run(["tmux", "set", "-g", "pane-base-index", "1"], quiet=True)
+    run(["tmux", "set", "-g", "status-left",
+         f"#[fg=green][OT: {repo_name}/{slug}]#[default] "], quiet=True)
+    run(["tmux", "rename-window", "-t", f"{session}:1", "code"])
+    run(["tmux", "send-keys", "-t", f"{session}:1", "opencode", "Enter"])
+    run(["tmux", "new-window", "-t", f"{session}:2", "-c", str(wt_dir), "-n", "shell"])
+    run(["tmux", "send-keys", "-t", f"{session}:2",
+         f"echo '# opencode-tree worktree: {wt_dir}'", "Enter"])
+
+    info(f"  Window 1: opencode")
+    info(f"  Window 2: shell")
+
+
+def attach_loop():
+    session = S["session_name"]
+    info("Attaching to tmux session. Detach with Ctrl+B d. Exit session to trigger cleanup.")
+
+    while True:
+        if not tmux_has_session(session):
+            time.sleep(1)
+            if not tmux_has_session(session):
+                break
+        run(["tmux", "attach-session", "-t", session],
+            stderr=subprocess.DEVNULL)
+
+
+# ── Cleanup ──────────────────────────────────────────────────────────
+def cleanup():
+    if S["cleanup_done"]:
+        return
+    S["cleanup_done"] = True
+
+    wt_dir = S.get("worktree_dir")
+    if not wt_dir or not wt_dir.exists():
+        return
+
+    sentinel = S.get("sentinel_file")
+    if sentinel and sentinel.exists():
+        die("Cleanup already in progress. Second interrupt = hard exit.", code=2)
+    if sentinel:
+        sentinel.touch()
+
+    print()
+    info("Session ended. Running cleanup...")
+
+    repo = S.get("repo_path")
+    branch = S.get("branch")
+    is_temp = S.get("is_temp_branch", False)
+
+    if repo and repo.exists():
+        base = S.get("base_branch", detect_default_branch(repo))
+        dirty_files, stash_count = is_dirty(wt_dir) if wt_dir.exists() else (0, 0)
+
+        if dirty_files > 0 or stash_count > 0:
+            parts = []
+            if dirty_files > 0:
+                parts.append(f"{dirty_files} uncommitted file(s)")
+            if stash_count > 0:
+                parts.append(f"{stash_count} stashes")
+            warn(f"Worktree has dirty state: {', '.join(parts)}")
+
+            if not S["force"]:
+                if is_temp:
+                    if not confirm("This is a temp branch — changes will be lost. Remove?"):
+                        die("Cleanup aborted by user")
+                else:
+                    action = choose("Uncommitted changes found.",
+                                    {"s": "stash", "d": "destroy", "c": "cancel"})
+                    if action == "cancel" or not action:
+                        die("Cleanup aborted by user")
+                    elif action == "stash":
+                        ts = int(time.time())
+                        git("stash", "push", "-m", f"opencode-tree auto-stash {ts}",
+                            cwd=wt_dir)
+                        info("Changes stashed in worktree repo")
+
+        if is_temp and branch:
+            if remote_branch_exists(branch, repo):
+                warn(f"Branch '{branch}' also exists on origin.")
+                info(f"  To delete remote: git push origin --delete {branch}")
+
+            if branch_exists(branch, repo):
+                unpushed = unpushed_commits(branch, base, repo)
+                if unpushed:
+                    if S["force"] or confirm(
+                            f"Temp branch '{branch}' has {len(unpushed)} unpushed commit(s). "
+                            f"Delete anyway?", default=False):
+                        git("branch", "-D", branch, cwd=repo)
+                    else:
+                        info(f"Keeping branch '{branch}'")
+                else:
+                    git("branch", "-D", branch, cwd=repo)
+
+    if wt_dir.exists() and repo and repo.exists():
+        if git("rev-parse", "--git-dir", cwd=wt_dir, quiet=True).returncode == 0:
+            if S["force"]:
+                info("Force-removing worktree...")
+                git("worktree", "remove", "--force", str(wt_dir), cwd=repo)
+            else:
+                result = git("worktree", "remove", str(wt_dir), cwd=repo,
+                             capture=True)
+                if result.returncode != 0:
+                    warn(f"Failed to remove worktree (may have dirty state). "
+                         f"Use --force to override.")
+        else:
+            info("Cleaning up orphan worktree directory...")
+            shutil.rmtree(wt_dir, ignore_errors=True)
+
+    if repo and repo.exists():
+        git("worktree", "prune", cwd=repo)
+
+    for d in [wt_dir.parent, wt_dir.parent.parent]:
+        if d.exists():
+            try:
+                d.rmdir()
+            except OSError:
+                pass
+
+    info("Cleanup complete.")
+
+
+def prune_stale():
+    if not OPENCODE_TREE_DIR.exists():
+        info(f"No data directory found at {OPENCODE_TREE_DIR}")
+        return
+
+    info(f"Scanning for stale worktrees in {OPENCODE_TREE_DIR}...")
+    found = False
+
+    for metafile in OPENCODE_TREE_DIR.rglob(".opencode-tree.json"):
+        meta = read_metadata(metafile)
+        if not meta:
+            continue
+
+        wt_dir = metafile.parent
+        session_name = meta.get("tmux_session", "")
+        repo_path_str = meta.get("repo_path", "")
+        repo_path = Path(repo_path_str) if repo_path_str else None
+
+        session_alive = False
+        if session_name and tmux_has_session(session_name):
+            session_alive = True
+
+        if session_alive:
+            continue
+
+        found = True
+        info(f"Removing stale worktree: \033[36m{wt_dir}\033[0m")
+
+        if repo_path and repo_path.exists():
+            git("worktree", "remove", "--force", str(wt_dir), cwd=repo_path,
+                capture=True, quiet=True)
+            git("worktree", "prune", cwd=repo_path)
+
+        shutil.rmtree(wt_dir, ignore_errors=True)
+
+        for d in [wt_dir.parent, wt_dir.parent.parent]:
+            if d.exists():
+                try:
+                    d.rmdir()
+                except OSError:
+                    pass
+
+    if not found:
+        info("No stale worktrees found.")
+
+
+# ── Resume logic ─────────────────────────────────────────────────────
+def resume_session(project: str, branch_arg: str):
+    repo = S["repo_path"]
+    repo_name = repo.name
+
+    if branch_arg:
+        slug = slugify(branch_arg)
+        session = f"{SESSION_PREFIX}-{repo_name}-{slug}"
+
+        if not tmux_has_session(session):
+            die(f"Session '{session}' does not exist. Start a new session without --resume.")
+
+        wt_dir = OPENCODE_TREE_DIR / repo_name / slug
+        S["session_name"] = session
+        S["worktree_dir"] = wt_dir
+        S["metadata_file"] = wt_dir / ".opencode-tree.json"
+        S["sentinel_file"] = wt_dir / ".opencode-tree.cleaning"
+
+        info(f"Resuming session: \033[36m{session}\033[0m")
+        attach_loop()
+        return
+
+    existing = []
+    for d in OPENCODE_TREE_DIR.iterdir():
+        if d.is_dir() and d.name == repo_name:
+            for wt in d.iterdir():
+                mf = wt / ".opencode-tree.json"
+                meta = read_metadata(mf)
+                if meta:
+                    sn = meta.get("tmux_session", "")
+                    if sn and tmux_has_session(sn):
+                        existing.append(sn)
+
+    if not existing:
+        die(f"No existing opencode-tree sessions found for '{project}'")
+    elif len(existing) == 1:
+        S["session_name"] = existing[0]
+        info(f"Resuming session: \033[36m{existing[0]}\033[0m")
+        attach_loop()
+    else:
+        print("Multiple sessions found:")
+        for s in existing:
+            print(f"  {s}")
+        die("Specify a branch to resume.")
+
+
+# ── Signal handling ─────────────────────────────────────────────────
+def handle_signal(signum, frame):
+    print()
+    warn("Interrupt received. Running cleanup...")
+    cleanup()
+    sys.exit(1)
+
+
+# ── Argument parsing ────────────────────────────────────────────────
+def parse_args(argv):
+    parser = argparse.ArgumentParser(
+        prog="opencode-tree",
+        description="Isolated git worktree + tmux sessions for opencode",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=f"""
+Examples:
+  opencode-tree .                         Temp branch from current repo
+  opencode-tree ./my-project feature/x    Existing branch in local repo
+  opencode-tree --resume .                Reattach to session
+  opencode-tree --prune                   Clean stale worktrees
+
+Environment:
+  OPENCODE_TREE_DIRS  Colon-separated base directories to search for repos
+                      When a name (not a path) is given, each dir is checked
+                      for a matching subdirectory, e.g.:
+                        OPENCODE_TREE_DIRS=~/code:~/work
+""")
+    parser.add_argument("project", nargs="?",
+                        help="Path to git repo, or a name found in OPENCODE_TREE_DIRS")
+    parser.add_argument("branch", nargs="?",
+                        help="Branch name (auto-generated if omitted)")
+    parser.add_argument("-f", "--force", action="store_true",
+                        help="Skip all prompts during cleanup (destructive)")
+    parser.add_argument("--no-tmux", action="store_true",
+                        help="Skip tmux, run opencode in current terminal")
+    parser.add_argument("-r", "--resume", action="store_true",
+                        help="Reattach to existing tmux session")
+    parser.add_argument("--prune", action="store_true",
+                        help="Scan and remove stale worktrees, then exit")
+    parser.add_argument("-b", "--base", default=None,
+                        help="Base branch for temp branches (auto-detected by default)")
+    parser.add_argument("--version", action="version", version=f"opencode-tree v{VERSION}")
+
+    args = parser.parse_args(argv)
+
+    if args.prune:
+        return args
+
+    if not args.project and not args.resume:
+        cwd_is_repo = is_git_repo(Path.cwd())
+        if cwd_is_repo:
+            args.project = "."
+        else:
+            parser.print_help()
+            print()
+            die("Project name is required (or use --prune)")
+
+    return args
+
+
+# ── Main ─────────────────────────────────────────────────────────────
+def main():
+    signal.signal(signal.SIGINT, handle_signal)
+    signal.signal(signal.SIGTERM, handle_signal)
+
+    args = parse_args(sys.argv[1:])
+
+    S["force"] = args.force
+    S["no_tmux"] = args.no_tmux
+
+    if args.prune:
+        prune_stale()
+        return
+
+    validate_tools()
+
+    info(f"opencode-tree v{VERSION}")
+
+    if args.project:
+        info(f"Resolving project: \033[36m{args.project}\033[0m")
+        repo_path = resolve_repo(args.project)
+        if not repo_path:
+            die(f"Repo not found: '{args.project}'. "
+                f"Provide a path to a git repo, or set OPENCODE_TREE_DIRS "
+                f"to search by name.")
+        S["repo_path"] = repo_path
+        info(f"Repository: \033[36m{repo_path}\033[0m")
+
+    S["base_branch"] = args.base or detect_default_branch(S["repo_path"])
+    info(f"Base branch: \033[36m{S['base_branch']}\033[0m")
+
+    if args.resume:
+        resume_session(args.project, args.branch)
+        return
+
+    branch = create_branch_strategy(args.branch)
+    S["branch"] = branch
+
+    create_worktree(branch)
+
+    slug = slugify(branch)
+    S["session_name"] = f"{SESSION_PREFIX}-{S['repo_path'].name}-{slug}"
+
+    write_metadata(branch)
+
+    if S["no_tmux"]:
+        info("Launching opencode in worktree (no tmux)...")
+        info(f"Worktree: \033[36m{S['worktree_dir']}\033[0m")
+        info("When opencode exits, cleanup will run.")
+        os.chdir(str(S["worktree_dir"]))
+        run(["opencode"])
+        cleanup()
+        return
+
+    setup_tmux_session()
+    attach_loop()
+    cleanup()
+
+
+if __name__ == "__main__":
+    main()
