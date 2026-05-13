@@ -735,6 +735,7 @@ Examples:
   opencode-tree .                         Temp branch from current git repo
   opencode-tree /path/to/repo             Temp branch, specific repo
   opencode-tree .  feature/x              Use existing branch
+  opencode-tree .  feature/x --from develop   Create feature/x from develop
   opencode-tree /some/dir                 Plain mode (non-git directory)
   opencode-tree --resume .                Reattach to session
   opencode-tree --list                    Show all sessions
@@ -764,8 +765,8 @@ Environment:
                         help="With --list, continuously refresh the view")
     parser.add_argument("--prune", action="store_true",
                         help="Remove stale worktrees and exit")
-    parser.add_argument("-b", "--base", default=None,
-                        help="Base branch (git mode; auto-detected by default)")
+    parser.add_argument("-b", "--base", "--from", dest="base", default=None,
+                        help="Source branch when creating a new branch (auto-detected by default)")
     parser.add_argument("--version", action="version", version=f"opencode-tree v{VERSION}")
 
     args = parser.parse_args(argv)
