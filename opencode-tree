@@ -498,6 +498,29 @@ def cleanup():
 
 
 # ── Remove specific session ──────────────────────────────────────────
+def _kill_processes_in_dir(dir_path: Path):
+    if not dir_path.exists():
+        return
+    if shutil.which("lsof"):
+        result = run(["lsof", "+D", str(dir_path), "-t"], capture=True, quiet=True)
+        if result.returncode == 0:
+            pids = [int(p) for p in result.stdout.strip().split() if p.isdigit()]
+            if pids:
+                info(f"Killing {len(pids)} process(es) still using worktree...")
+                for pid in pids:
+                    try:
+                        os.kill(pid, signal.SIGTERM)
+                    except OSError:
+                        pass
+                time.sleep(0.3)
+                for pid in pids:
+                    try:
+                        os.kill(pid, 0)
+                        os.kill(pid, signal.SIGKILL)
+                    except OSError:
+                        pass
+
+
 def remove_session(session_pattern: str):
     S["passive_mode"] = True
 
@@ -531,6 +554,11 @@ def remove_session(session_pattern: str):
     if tmux_has_session(session_pattern):
         info(f"Killing tmux session: \033[36m{session_pattern}\033[0m")
         run(["tmux", "kill-session", "-t", session_pattern], quiet=True, capture=True)
+        time.sleep(0.3)
+
+    wt_dir = meta_dir if meta_dir else (S.get("worktree_dir") if meta else None)
+    if wt_dir:
+        _kill_processes_in_dir(wt_dir)
 
     if meta:
         cleanup()
