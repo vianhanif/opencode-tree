@@ -328,6 +328,21 @@ def read_metadata(filepath: Path) -> dict:
 
 
 # ── Tmux (shared) ────────────────────────────────────────────────────
+_SHELL_CMDS = {"zsh", "bash", "fish", "sh", "dash", "ksh", "tcsh", "ash", "elvish", "nu"}
+
+
+def _session_has_opencode(session_name: str) -> bool:
+    result = run(["tmux", "list-panes", "-t", session_name, "-F", "#{pane_current_command}"],
+                 capture=True, quiet=True)
+    if result.returncode != 0:
+        return False
+    for cmd in result.stdout.strip().split("\n"):
+        c = cmd.strip()
+        if c and c not in _SHELL_CMDS:
+            return True
+    return False
+
+
 def tmux_has_session(name: str) -> bool:
     if not shutil.which("tmux"):
         return False
@@ -620,12 +635,13 @@ def collect_sessions():
             if not meta:
                 continue
             sn = meta.get("tmux_session", "")
+            active = sn in active_tmux and (sn and _session_has_opencode(sn))
             sessions.append({
                 "session": sn,
                 "project": meta.get("project", "?"),
                 "branch": meta.get("branch", "?"),
                 "mode": meta.get("mode", "?"),
-                "active": sn in active_tmux,
+                "active": active,
                 "temp_branch": meta.get("temp_branch", False),
                 "created_at": meta.get("created_at", ""),
                 "repo_path": meta.get("repo_path", ""),
@@ -638,7 +654,7 @@ def collect_sessions():
             "project": "?",
             "branch": "?",
             "mode": "?",
-            "active": True,
+            "active": _session_has_opencode(name),
             "temp_branch": False,
             "created_at": "",
             "repo_path": "",
