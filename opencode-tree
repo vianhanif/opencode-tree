@@ -553,10 +553,16 @@ def remove_session(session_pattern: str):
 
     opencode_pid = meta.get("opencode_pid") if meta else None
     if opencode_pid:
-        try:
-            os.kill(opencode_pid, signal.SIGTERM)
-        except OSError:
-            pass
+        for sig in (signal.SIGTERM, signal.SIGINT, signal.SIGKILL):
+            try:
+                os.kill(opencode_pid, 0)
+            except OSError:
+                break
+            try:
+                os.kill(opencode_pid, sig)
+            except OSError:
+                break
+            time.sleep(0.3)
 
     if tmux_has_session(session_pattern):
         info(f"Killing tmux session: \033[36m{session_pattern}\033[0m")
